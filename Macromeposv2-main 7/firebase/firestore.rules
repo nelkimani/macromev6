@@ -1,0 +1,160 @@
+rules_version = '2';
+
+// MACROME — Firestore security rules
+// Paste into Firebase console → Firestore Database → Rules → Publish.
+//
+//  BEFORE YOU PASTE: change the setup code on the line marked  <<< CHANGE THIS.
+//  Edit it in the console only (this folder is uploaded with the app, so a real code written here would be public).
+//  The code is asked once, on the very first launch, to create the owner account. After that it does nothing.
+//
+// Roles (field `role` in users/{uid}):
+//   super    owner: everything, all shops
+//   admin    manager. shop = ''  -> all shops;  shop = 'A'|'B'|'C' -> that shop only
+//   cashier  attendant: one shop only, can sell and read that shop's stock and sales
+//
+// Phase 1 uses: users, meta, bootstrap.  The rest is the agreed data model for later phases; it is deny-by-default
+// until the app starts writing there, and each phase will re-check its own rules.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function setupCode() { return 'CHANGE-THIS-SETUP-CODE'; }    // <<< CHANGE THIS
+
+    // ── who is asking ──────────────────────────────────────────
+    function signedIn()   { return request.auth != null; }
+    function myPath()     { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasProfile() { return signedIn() && exists(myPath()); }
+    function me()         { return get(myPath()).data; }
+    function active()     { return hasProfile() && me().active == true; }          // switched-off accounts get nothing
+    function isSuper()    { return active() && me().role == 'super'; }
+    function isManager()  { return active() && (me().role == 'super' || me().role == 'admin'); }
+    function isHQ()       { return isManager() && me().shop == ''; }               // manager of all shops
+    function inShop(s)    { return active() && (isHQ() || me().shop == s); }       // may see / sell in shop s
+    function managesShop(s) { return isManager() && (me().shop == '' || me().shop == s); }
+    function validShop(s) { return s in ['A', 'B', 'C']; }
+
+    // ── a user record must look exactly like this ──────────────
+    function userShape(d, creating) {
+      return d.keys().hasOnly(['name', 'username', 'role', 'shop', 'code', 'active', 'created'])
+        && d.keys().hasAll(['name', 'username', 'role', 'shop', 'code', 'active'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 40
+        && d.username is string && d.username.matches('^[a-z0-9._-]{3,20}$')
+        && d.code is string && d.code.matches('^[A-Z0-9]{3}$')
+        && d.active is bool && (!creating || d.active == true)
+        && d.role in ['super', 'admin', 'cashier']
+        && (d.shop == '' || validShop(d.shop))
+        && (d.role != 'cashier' || d.shop != '')
+        && (d.role != 'super' || d.shop == '');
+    }
+    // may the signed-in manager manage this person (reset / switch off / move)?
+    function manages(t) {
+      return me().role == 'super'
+        || (me().role == 'admin' && t.role == 'cashier' && (me().shop == '' || me().shop == t.shop));
+    }
+
+    // ── users ──────────────────────────────────────────────────
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid
+                    || (isManager() && (isHQ() || resource.data.shop == me().shop)));
+      allow list: if isManager() && (isHQ() || resource.data.shop == me().shop);
+
+      // first owner (needs the setup code, only while no owner exists) OR a manager adding staff
+      allow create: if (request.auth.uid == uid
+                         && userShape(request.resource.data, true)
+                         && request.resource.data.role == 'super'
+                         && !exists(/databases/$(database)/documents/meta/owner)
+                         && getAfter(/databases/$(database)/documents/meta/owner).data.uid == uid
+                         && getAfter(/databases/$(database)/documents/bootstrap/$(setupCode())).data.uid == uid)
+                    || (isManager() && request.auth.uid != uid
+                         && userShape(request.resource.data, true)
+                         && manages(request.resource.data));
+
+      // a manager may rename, move or switch off someone they manage (never themselves, never change role/username)
+      allow update: if isManager() && request.auth.uid != uid
+                    && manages(resource.data)
+                    && userShape(request.resource.data, false)
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'shop', 'active', 'code'])
+                    && (me().role == 'super' || me().shop == '' || request.resource.data.shop == me().shop);
+
+      allow delete: if false;            // switch accounts off instead; the owner can remove logins in the console
+    }
+
+    // ── first-launch owner setup ───────────────────────────────
+    match /meta/owner {
+      allow get: if true;                // the sign-in screen asks "has the owner been set up yet?"
+      allow create: if signedIn()
+                    && request.resource.data.keys().hasOnly(['uid', 'at'])
+                    && request.resource.data.uid == request.auth.uid
+                    && getAfter(/databases/$(database)/documents/bootstrap/$(setupCode())).data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+    match /bootstrap/{code} {
+      allow create: if signedIn() && code == setupCode()
+                    && !exists(/databases/$(database)/documents/meta/owner)
+                    && request.resource.data.keys().hasOnly(['uid'])
+                    && request.resource.data.uid == request.auth.uid;
+      allow read, update, delete: if false;
+    }
+
+    // ── shared settings (business info, shop names) ────────────
+    match /settings/{id} {
+      allow read: if active();
+      allow write: if isHQ();
+    }
+
+    // ── product catalogue: shared by all shops ─────────────────
+    match /products/{pid} {
+      allow read: if active();
+      allow write: if isHQ();
+    }
+
+    // ── stock per shop & product: doc id "<shop>_<productId>", fields {shop, pid, qty} ──
+    match /stock/{sid} {
+      allow get, list: if inShop(resource.data.shop);
+      allow create: if validShop(request.resource.data.shop) && managesShop(request.resource.data.shop);
+      allow update: if request.resource.data.shop == resource.data.shop && (
+                      managesShop(resource.data.shop)
+                      // an attendant can only take stock OUT of their own shop (a sale); it may go below 0
+                      // when two tills sell the last unit offline, because the goods have really left
+                      || (inShop(resource.data.shop)
+                          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['qty'])
+                          && request.resource.data.qty < resource.data.qty));
+      allow delete: if isHQ();
+    }
+
+    // ── sales: written once, never edited ──────────────────────
+    match /sales/{id} {
+      allow get, list: if inShop(resource.data.shop);
+      allow create: if validShop(request.resource.data.shop)
+                    && inShop(request.resource.data.shop)
+                    && request.resource.data.cashierUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ── stock receipts: written once ───────────────────────────
+    match /stockReceipts/{id} {
+      allow get, list: if inShop(resource.data.shop);
+      allow create: if validShop(request.resource.data.shop) && managesShop(request.resource.data.shop)
+                    && request.resource.data.by == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ── transfers between shops: written once (all-shops managers; revisited in Phase 4) ──
+    match /transfers/{id} {
+      allow get, list: if isManager() && (isHQ() || resource.data.from == me().shop || resource.data.to == me().shop);
+      allow create: if isHQ() && validShop(request.resource.data.from) && validShop(request.resource.data.to)
+                    && request.resource.data.by == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ── expenses: managers; shop managers only for their own shop ──
+    match /expenses/{id} {
+      allow get, list: if isManager() && (isHQ() || resource.data.shop == me().shop);
+      allow create: if isHQ() || (isManager() && request.resource.data.shop == me().shop);
+      allow delete: if isHQ() || (isManager() && resource.data.shop == me().shop);
+      allow update: if false;
+    }
+
+    // anything not listed above is refused
+  }
+}

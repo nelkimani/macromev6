@@ -1,0 +1,15 @@
+[
+ "chart.umd.min.js",
+ "jspdf.umd.min.js",
+ "html2canvas.min.js",
+ "firebase-app-compat.js",
+ "firebase-auth-compat.js",
+ "firebase-firestore-compat.js",
+ "fonts.css",
+ "fonts/LDIoaomQNQcsA88c7O9yZ4KMCoOg4Ko20yw.woff2",
+ "fonts/LDIoaomQNQcsA88c7O9yZ4KMCoOg4Ko40yyygA.woff2",
+ "fonts/co3ZmX5slCNuHLi8bLeY9MK7whWMhyjYrEtGmSq17w.woff2",
+ "fonts/co3ZmX5slCNuHLi8bLeY9MK7whWMhyjYrEtImSo.woff2",
+ "fonts/co3bmX5slCNuHLi8bLeY9MK7whWMhyjYp3tKgS4.woff2",
+ "fonts/co3bmX5slCNuHLi8bLeY9MK7whWMhyjYqXtK.woff2"
+]
